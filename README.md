@@ -1,6 +1,8 @@
 # Basic Pitch for Max
 
-This project uses [nodeformax](https://docs.cycling74.com/apiref/nodeformax/) to run [Spotify's Basic Pitch](https://github.com/spotify/basic-pitch) algorithm within Max/MSP.
+### Polyphonic Audio -> MIDI conversion in MaxMSP!
+
+This project uses [nodeformax](https://docs.cycling74.com/apiref/nodeformax/) to run [Spotify's Basic Pitch](https://github.com/spotify/basic-pitch) algorithm within Max/MSP, thanks to the handy CLI version [basicpitch.cpp] (https://github.com/sevagh/basicpitch.cpp)
 
 ## Requirements
 
@@ -14,6 +16,8 @@ This project uses [nodeformax](https://docs.cycling74.com/apiref/nodeformax/) to
 2. Install dependencies as described in the project.
 3. Use the provided Max patch to process audio files.
 4. To preprocess non-WAV audio, use the included method to convert files to WAV.
+
+See the helpfile for usage.
 
 ## Notes
 
