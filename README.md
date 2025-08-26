@@ -4,11 +4,13 @@
 
 This project uses [nodeformax](https://docs.cycling74.com/apiref/nodeformax/) to run [Spotify's Basic Pitch](https://github.com/spotify/basic-pitch) algorithm within Max/MSP, thanks to the handy CLI version [basicpitch.cpp] (https://github.com/sevagh/basicpitch.cpp)
 
+This n4m implementation relies on [this fork](https://github.com/jamesstaub/basicpitch.cpp) of the basic pitch CLI
+
 ## Requirements
 
 - macOS (currently only tested/built for Mac)
 - [Max/MSP](https://cycling74.com/products/max)
-- [ffmpeg](https://ffmpeg.org/) (required for audio preprocessing)
+- [ffmpeg](https://ffmpeg.org/) (optional for audio preprocessing)
 
 ## Usage
 
@@ -17,7 +19,7 @@ This project uses [nodeformax](https://docs.cycling74.com/apiref/nodeformax/) to
 3. Use the provided Max patch to process audio files.
 4. To preprocess non-WAV audio, use the included method to convert files to WAV.
 
-See the helpfile for usage.
+See the `basic-pitch` object's helpfile for usage.
 
 ## Notes
 
