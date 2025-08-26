@@ -22,9 +22,55 @@ class BasicPitchServer {
         // Set up Max API handlers
         this.setupMaxHandlers();
         
+        // Set up periodic cleanup of stale requests
+        this.setupCleanupTimer();
+        
         // Handle graceful shutdown
         process.on('SIGINT', this.shutdown.bind(this));
         process.on('SIGTERM', this.shutdown.bind(this));
+        
+        // Handle uncaught exceptions to prevent crashes
+        process.on('uncaughtException', (error) => {
+            Max.post(`❌ Uncaught exception: ${error.message}`);
+            Max.post(`Stack trace: ${error.stack}`);
+            Max.outlet('error', `Uncaught exception: ${error.message}`);
+        });
+        
+        // Handle unhandled promise rejections
+        process.on('unhandledRejection', (reason, promise) => {
+            Max.post(`❌ Unhandled promise rejection: ${reason}`);
+            Max.outlet('error', `Unhandled promise rejection: ${reason}`);
+        });
+    }
+
+    setupCleanupTimer() {
+        // Clean up stale requests every 20 seconds
+        setInterval(() => {
+            const now = Date.now();
+            const staleRequests = [];
+            
+            for (const [filePath, requestInfo] of this.pendingRequests.entries()) {
+                const age = now - requestInfo.startTime;
+                if (age > 20000) { // 20 seconds for periodic cleanup
+                    staleRequests.push(filePath);
+                }
+            }
+            
+            for (const filePath of staleRequests) {
+                const requestInfo = this.pendingRequests.get(filePath);
+                const fileName = path.basename(filePath);
+                
+                Max.post(`🧹 Auto-cleanup stale request: ${fileName} (${Math.round((now - requestInfo.startTime)/1000)}s old)`);
+                
+                // Cleanup any temp file if it exists
+                if (requestInfo.cleanupFile && fs.existsSync(requestInfo.cleanupFile)) {
+                    fs.unlinkSync(requestInfo.cleanupFile);
+                    Max.post(`🗑️ Cleaned up stale temp file: ${path.basename(requestInfo.cleanupFile)}`);
+                }
+                
+                this.pendingRequests.delete(filePath);
+            }
+        }, 20000); // Run every 20 seconds
     }
 
     setupMaxHandlers() {
@@ -37,7 +83,12 @@ class BasicPitchServer {
             }
             
             Max.post(`Received path: ${audioPath}`);
-            this.processAudioFile(audioPath);
+            
+            // Wrap async call in try-catch to prevent process crashes
+            this.processAudioFile(audioPath).catch(error => {
+                Max.post(`❌ Error in processAudioFile: ${error.message}`);
+                Max.outlet('error', `Processing error: ${error.message}`, audioPath);
+            });
         });
         
         // Handler for processing with preprocessing
@@ -47,9 +98,12 @@ class BasicPitchServer {
                 Max.outlet('error', 'No audio path provided');
                 return;
             }
-            
-            Max.post(`Received preprocess request: ${audioPath}`);
-            this.processAudioFile(audioPath, null, true);
+                    
+            // Wrap async call in try-catch to prevent process crashes
+            this.processAudioFile(audioPath, null, true).catch(error => {
+                Max.post(`❌ Error in processAudioFile (preprocess): ${error.message}`);
+                Max.outlet('error', `Preprocessing error: ${error.message}`, audioPath);
+            });
         });
         
         // Handler for checking daemon status
@@ -73,9 +127,42 @@ class BasicPitchServer {
             Max.post(`BasicPitch Server - Status: ${status}, Pending: ${pending}`);
             Max.outlet('info', status, pending);
         });
+
+        // Handler for setting parameters and restarting daemon
+        Max.addHandler('flags', (...args) => {
+            try {
+                // Remove the first argument which is the message name
+                const paramList = args.slice(0);
+                
+                Max.post(`📝 Received flags: ${JSON.stringify(paramList)}`);
+                
+                // Parse and validate the parameters
+                const flags = this.parseMaxListToFlags(paramList);
+                
+                if (flags.length === 0) {
+                    Max.post('📝 No parameters provided, using default settings');
+                    return;
+                }
+                
+                Max.post(`✅ Parsed flags: ${flags.join(' ')}`);
+                
+                // Restart daemon with new parameters
+                this.restartDaemonWithFlags(flags);
+                
+            } catch (error) {
+                Max.post(`❌ Flags error: ${error.message}`);
+                Max.outlet('flags_error', error.message);
+            }
+        });
     }
     
-    startDaemon() {
+    startDaemon(flags = []) {
+        // Prevent starting multiple daemons
+        if (this.daemonProcess) {
+            Max.post(`⚠️ Daemon already running. Use stopDaemon() first if restart needed.`);
+            return;
+        }
+        
         const cliPath = path.join(__dirname, 'basic-pitch-cli', 'basicpitch_daemon');
         const tempDir = path.join(__dirname, 'temp-midi');
         
@@ -84,12 +171,16 @@ class BasicPitchServer {
             fs.mkdirSync(tempDir, { recursive: true });
         }
         
+        // Build command arguments
+        const args = ['--daemon', tempDir, ...flags];
+        
         console.log('Starting BasicPitch daemon...');
-        this.daemonProcess = spawn(cliPath, ['--daemon', tempDir]);
+        console.log(`Command: ${cliPath} ${args.join(' ')}`);
+        this.daemonProcess = spawn(cliPath, args);
         
         this.daemonProcess.stdout.on('data', (data) => {
             const output = data.toString().trim();
-            Max.post(`Daemon: ${output}`);
+            // Max.post(`Daemon: ${output}`);
             
             if (output.includes('Ready for commands')) {
                 this.daemonReady = true;
@@ -102,8 +193,18 @@ class BasicPitchServer {
         
         this.daemonProcess.stderr.on('data', (data) => {
             const error = data.toString().trim();
-            Max.post(`Daemon error: ${error}`);
-            Max.outlet('daemon_error', error);
+            
+            // Filter out noisy ONNX schema registration warnings
+            if (error.includes('Schema error') ||
+                error.includes('but it is already registered from file')) {
+                // These are harmless ONNX Runtime warnings, suppress them
+                return;
+            }
+            
+            // Only log actual errors that matter
+            if (error && error.length > 0) {
+                Max.post(`Daemon error: ${error}`);
+            }
         });
         
         this.daemonProcess.on('close', (code) => {
@@ -111,6 +212,12 @@ class BasicPitchServer {
             Max.outlet('daemon_closed', code);
             this.daemonReady = false;
             this.daemonProcess = null;
+            
+            // Clear any pending requests since daemon is dead
+            this.pendingRequests.clear();
+            
+            // Don't automatically restart - let explicit calls handle restart
+            Max.post(`🛑 Daemon stopped. Use 'flags' command or send new file to restart.`);
         });
         
         this.daemonProcess.on('error', (error) => {
@@ -118,6 +225,184 @@ class BasicPitchServer {
             Max.outlet('daemon_start_error', error.message);
             this.daemonReady = false;
         });
+    }
+
+    // Stop the current daemon if running
+    stopDaemon() {
+        return new Promise((resolve) => {
+            if (this.daemonProcess) {
+                Max.post('🛑 Stopping current daemon...');
+                
+                // Set up cleanup when process closes
+                this.daemonProcess.once('close', () => {
+                    this.daemonReady = false;
+                    this.daemonProcess = null;
+                    Max.post('✅ Daemon stopped');
+                    resolve();
+                });
+                
+                // Send quit command and kill if necessary
+                this.daemonProcess.stdin.write('quit\n');
+                
+                // Force kill after timeout
+                setTimeout(() => {
+                    if (this.daemonProcess) {
+                        this.daemonProcess.kill('SIGKILL');
+                    }
+                }, 3000);
+            } else {
+                resolve();
+            }
+        });
+    }
+
+    // Restart daemon with new flags
+    async restartDaemonWithFlags(flags) {
+        Max.post('🔄 Restarting daemon with new parameters...');
+        
+        try {
+            // Stop current daemon
+            await this.stopDaemon();
+            
+            // Start daemon with new flags
+            this.startDaemon(flags);
+            
+            Max.post('✅ Daemon restart initiated');
+            Max.outlet('daemon_restarting');
+            Max.outlet('flags_applied', flags.join(' '));
+            
+        } catch (error) {
+            Max.post(`❌ Error restarting daemon: ${error.message}`);
+            Max.outlet('daemon_restart_error', error.message);
+        }
+    }
+
+    // Validate parameter values according to CLI specification
+    validateParameter(key, value) {
+        const validations = {
+            'onset-threshold': {
+                min: 0.0,
+                max: 1.0,
+                type: 'number',
+                description: 'Onset threshold (higher = fewer onsets detected)'
+            },
+            'frame-threshold': {
+                min: 0.0,
+                max: 1.0,
+                type: 'number',
+                description: 'Frame threshold (higher = fewer notes detected)'
+            },
+            'min-frequency': {
+                min: 20.0,
+                max: 8000.0,
+                type: 'number',
+                description: 'Minimum frequency in Hz'
+            },
+            'max-frequency': {
+                min: 20.0,
+                max: 8000.0,
+                type: 'number',
+                description: 'Maximum frequency in Hz'
+            },
+            'min-note-length': {
+                min: 0.01,
+                max: 10.0,
+                type: 'number',
+                description: 'Minimum note length in seconds'
+            },
+            'tempo-bpm': {
+                min: 60.0,
+                max: 200.0,
+                type: 'number',
+                description: 'Tempo in BPM for beat tracking'
+            },
+            'use-melodia-trick': {
+                type: 'boolean',
+                description: 'Use melodia trick for better pitch tracking'
+            },
+            'include-pitch-bends': {
+                type: 'boolean',
+                description: 'Include pitch bends in MIDI output'
+            }
+        };
+
+        const validation = validations[key];
+        if (!validation) {
+            throw new Error(`Unknown parameter: ${key}`);
+        }
+
+        if (validation.type === 'number') {
+            const numValue = parseFloat(value);
+            if (isNaN(numValue)) {
+                throw new Error(`${key}: Value must be a number`);
+            }
+            if (numValue < validation.min || numValue > validation.max) {
+                throw new Error(`${key}: Value ${numValue} out of range [${validation.min}, ${validation.max}]`);
+            }
+            return numValue;
+        } else if (validation.type === 'boolean') {
+            if (value === true || value === 'true' || value === '1' || value === 1) {
+                return true;
+            } else if (value === false || value === 'false' || value === '0' || value === 0) {
+                return false;
+            } else {
+                throw new Error(`${key}: Value must be true/false`);
+            }
+        }
+
+        return value;
+    }
+
+    // Parse Max list into CLI flags
+    parseMaxListToFlags(maxList) {
+        const flags = [];
+        
+        try {
+            // Max sends arguments as separate items in the list
+            // Expected format: key1 value1 key2 value2 ...
+            for (let i = 0; i < maxList.length; i += 2) {
+                if (i + 1 >= maxList.length) {
+                    throw new Error(`Missing value for parameter: ${maxList[i]}`);
+                }
+                
+                const key = maxList[i].toString().replace(/^-+/, ''); // Remove leading dashes if present
+                const value = maxList[i + 1];
+                
+                // Validate the parameter
+                const validatedValue = this.validateParameter(key, value);
+                
+                // Handle special boolean flags that use --no- prefix
+                if (key === 'include-pitch-bends') {
+                    // If false (0), add --no-pitch-bends flag
+                    if (!validatedValue) {
+                        flags.push('--no-pitch-bends');
+                    }
+                    // If true (1), don't add any flag (pitch bends enabled by default)
+                } else if (key === 'use-melodia-trick') {
+                    // If false (0), add --no-melodia-trick flag
+                    if (!validatedValue) {
+                        flags.push('--no-melodia-trick');
+                    }
+                    // If true (1), don't add any flag (melodia trick enabled by default)
+                } else {
+                    // Handle regular parameters
+                    if (typeof validatedValue === 'boolean') {
+                        if (validatedValue) {
+                            flags.push(`--${key}`);
+                        }
+                        // For boolean false, we don't add the flag
+                    } else {
+                        flags.push(`--${key}`);
+                        flags.push(validatedValue.toString());
+                    }
+                }
+            }
+            
+            return flags;
+            
+        } catch (error) {
+            throw new Error(`Parameter validation failed: ${error.message}`);
+        }
     }
     
     // Find ffmpeg binary in common locations
@@ -212,7 +497,7 @@ class BasicPitchServer {
     async processAudioFile(filePath, requestId = null, usePreprocessing = false) {
         Max.post(`📁 Processing audio file: ${filePath}`);
         
-        // Check if file exists
+        // Check if file exists (use original path without escaping)
         if (!fs.existsSync(filePath)) {
             const error = `File not found: ${filePath}`;
             Max.post(`❌ Error: ${error}`);
@@ -220,12 +505,51 @@ class BasicPitchServer {
             return;
         }
         
-        // Check if daemon is ready
+        // Check if daemon is ready - if not, start it but don't restart if it's already running
         if (!this.daemonReady || !this.daemonProcess) {
-            const error = 'Daemon not ready. Please wait for initialization.';
-            Max.post(`❌ Error: ${error}`);
-            Max.outlet('error', error, filePath);
-            return;
+            if (!this.daemonProcess) {
+                Max.post(`🔄 Starting daemon for file processing...`);
+                this.startDaemon();
+                // Wait a moment for daemon to initialize
+                try {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                } catch (error) {
+                    Max.post(`❌ Error waiting for daemon: ${error.message}`);
+                    Max.outlet('error', `Daemon initialization error: ${error.message}`, filePath);
+                    return;
+                }
+            }
+            
+            if (!this.daemonReady) {
+                const error = 'Daemon not ready after initialization. Please try again.';
+                Max.post(`❌ Error: ${error}`);
+                Max.outlet('error', error, filePath);
+                return;
+            }
+        }
+        
+        // Check if this file is already being processed
+        if (this.pendingRequests.has(filePath)) {
+            const requestInfo = this.pendingRequests.get(filePath);
+            const age = Date.now() - requestInfo.startTime;
+
+            // If request is older than 20 seconds, assume it's stuck and remove it
+            if (age > 20000) {
+                const fileName = path.basename(filePath);
+                Max.post(`Clearing stale request for: ${fileName} (${Math.round(age/1000)}s old)`);
+                
+                // Cleanup any temp file if it exists
+                if (requestInfo.cleanupFile && fs.existsSync(requestInfo.cleanupFile)) {
+                    fs.unlinkSync(requestInfo.cleanupFile);
+                    Max.post(`🗑️ Cleaned up stale temp file: ${path.basename(requestInfo.cleanupFile)}`);
+                }
+                
+                this.pendingRequests.delete(filePath);
+            } else {
+                const fileName = path.basename(filePath);
+                Max.post(`File already being processed: ${fileName} (${age / 1000}s ago)`);
+                return;
+            }
         }
         
         let actualFilePath = filePath;
@@ -265,7 +589,12 @@ class BasicPitchServer {
         });
         
         // Send the process command to the daemon with custom output directory
-        const command = `process ${actualFilePath} ${inputDir}\n`;
+        // Use proper quotes - the daemon now handles them correctly with improved parsing
+        const command = `process "${actualFilePath}" "${inputDir}"\n`;
+        
+        // Debug: Log the exact command being sent
+        Max.post(`🔍 Debug: Sending command to daemon: ${command.trim()}`);
+        
         this.daemonProcess.stdin.write(command);
         
         Max.post(`🔄 Processing started for: ${fileName} -> ${expectedMidiPath}`);
@@ -283,19 +612,19 @@ class BasicPitchServer {
                     const midiFilePath = match[1];
                     const bytes = parseInt(match[2]);
                     
-                    Max.post(`🔍 Debug: Processing SUCCESS for MIDI: ${midiFilePath}`);
+                    // Max.post(`🔍 Debug: Processing SUCCESS for MIDI: ${midiFilePath}`);
                     
                     // Check if we've already processed this MIDI file
                     if (this.processedMidiFiles.has(midiFilePath)) {
-                        Max.post(`🔍 Debug: ⚠️ MIDI file already processed, skipping: ${midiFilePath}`);
+                        // Max.post(`🔍 Debug: ⚠️ MIDI file already processed, skipping: ${midiFilePath}`);
                         continue; // Continue to next line instead of return
                     }
                     
                     // Mark this MIDI file as processed
                     this.processedMidiFiles.add(midiFilePath);
                     
-                    Max.post(`🔍 Debug: Current pending requests: ${Array.from(this.pendingRequests.keys()).map(k => path.basename(k)).join(', ')}`);
-                    Max.post(`🔍 Debug: Processed MIDI files so far: ${Array.from(this.processedMidiFiles).map(p => path.basename(p)).join(', ')}`);
+                    // Max.post(`🔍 Debug: Current pending requests: ${Array.from(this.pendingRequests.keys()).map(k => path.basename(k)).join(', ')}`);
+                    // Max.post(`🔍 Debug: Processed MIDI files so far: ${Array.from(this.processedMidiFiles).map(p => path.basename(p)).join(', ')}`);
                     
                     // Find the original audio file path by matching filenames
                     let originalFile = null;
@@ -303,19 +632,19 @@ class BasicPitchServer {
                     
                     // Extract just the filename from the MIDI path for comparison
                     const midiBasename = path.basename(midiFilePath, '.mid');
-                    Max.post(`🔍 Debug: Looking for audio file that would produce MIDI: ${midiBasename}.mid`);
+                    // Max.post(`🔍 Debug: Looking for audio file that would produce MIDI: ${midiBasename}.mid`);
                     
                     for (const [audioPath, requestInfo] of this.pendingRequests.entries()) {
                         // Get what basename the daemon would use for MIDI output
                         const audioBaseName = path.basename(audioPath, path.extname(audioPath));
                         
-                        Max.post(`🔍 Debug: Checking audio: ${path.basename(audioPath)} -> would create: ${audioBaseName}.mid`);
+                        // Max.post(`🔍 Debug: Checking audio: ${path.basename(audioPath)} -> would create: ${audioBaseName}.mid`);
                         
                         // Match by basename - the daemon creates MIDI files with same basename as input
                         if (audioBaseName === midiBasename) {
                             originalFile = audioPath;
                             matchedRequest = requestInfo;
-                            Max.post(`🔍 Debug: ✅ Found match! Audio: ${path.basename(audioPath)} -> MIDI: ${midiBasename}.mid`);
+                            // Max.post(`🔍 Debug: ✅ Found match! Audio: ${path.basename(audioPath)} -> MIDI: ${midiBasename}.mid`);
                             break;
                         }
                     }
@@ -348,8 +677,8 @@ class BasicPitchServer {
                         }, 5000);
                     } else {
                         Max.post(`❌ Debug: No matching pending request found for ${midiFilePath}`);
-                        Max.post(`🔍 Debug: Available pending requests: ${Array.from(this.pendingRequests.keys()).join(', ')}`);
-                        Max.post(`🔍 Debug: Looking for basename: ${midiBasename}`);
+                        // Max.post(`🔍 Debug: Available pending requests: ${Array.from(this.pendingRequests.keys()).join(', ')}`);
+                        // Max.post(`🔍 Debug: Looking for basename: ${midiBasename}`);
                         // Remove from processed set since we couldn't match it
                         this.processedMidiFiles.delete(midiFilePath);
                     }
@@ -409,13 +738,85 @@ class BasicPitchServer {
 // Create and start the server
 const server = new BasicPitchServer();
 
-// Max message handlers
-Max.addHandler('path', (filePath) => {
-    server.processAudioFile(filePath, null, false);
-});
+Max.addHandler('help', () => {
+    Max.post('');
+    Max.post('🎵 BasicPitch Server for Max - Help');
+    Max.post('=====================================');
+    Max.post('');
+    Max.post('Available Commands:');
+    Max.post('  path <audio_file>     - Process audio file');
+    Max.post('  preprocess <audio_file> - Process with preprocessing');
+    Max.post('  flags <params...>     - Set parameters and restart daemon');
+    Max.post('  status               - Check daemon status');
+    Max.post('  pending              - Check pending requests count');
+    Max.post('  bang                 - Get general info');
+    Max.post('  help                 - Show this help');
+    Max.post('');
+    Max.post('Available Parameters for flags command:');
+    Max.post('');
+    
+    const validations = {
+        'onset-threshold': {
+            min: 0.0,
+            max: 1.0,
+            type: 'number',
+            description: 'Onset threshold (higher = fewer onsets detected)'
+        },
+        'frame-threshold': {
+            min: 0.0,
+            max: 1.0,
+            type: 'number',
+            description: 'Frame threshold (higher = fewer notes detected)'
+        },
+        'min-frequency': {
+            min: 20.0,
+            max: 8000.0,
+            type: 'number',
+            description: 'Minimum frequency in Hz'
+        },
+        'max-frequency': {
+            min: 20.0,
+            max: 8000.0,
+            type: 'number',
+            description: 'Maximum frequency in Hz'
+        },
+        'min-note-length': {
+            min: 0.01,
+            max: 10.0,
+            type: 'number',
+            description: 'Minimum note length in seconds'
+        },
+        'tempo-bpm': {
+            min: 60.0,
+            max: 200.0,
+            type: 'number',
+            description: 'Tempo in BPM for beat tracking'
+        },
+        'use-melodia-trick': {
+            type: 'boolean',
+            description: 'Use melodia trick for better pitch tracking'
+        },
+        'include-pitch-bends': {
+            type: 'boolean',
+            description: 'Include pitch bends in MIDI output'
+        }
+    };
 
-Max.addHandler('preprocess', (filePath) => {
-    server.processAudioFile(filePath, null, true);
+    for (const [param, info] of Object.entries(validations)) {
+        if (info.type === 'number') {
+            Max.post(`  ${param.padEnd(20)} ${info.type.padEnd(8)} [${info.min}-${info.max}]  ${info.description}`);
+        } else {
+            Max.post(`  ${param.padEnd(20)} ${info.type.padEnd(8)} [1/0]      ${info.description}`);
+        }
+    }
+    
+    Max.post('');
+    Max.post('Examples:');
+    Max.post('  flags onset-threshold 0.8 frame-threshold 0.3');
+    Max.post('  flags use-melodia-trick 1 include-pitch-bends 0');
+    Max.post('  flags min-frequency 80 max-frequency 2000 tempo-bpm 120');
+    Max.post('');
+    
 });
 
 Max.addHandler('test_ffmpeg', () => {
@@ -436,5 +837,4 @@ Max.addHandler('shutdown', () => {
 // Post startup message to Max console
 Max.post('🎵 BasicPitch Server for Max started');
 Max.post('Waiting for daemon to initialize...');
-Max.post('Send "path /path/to/audio.wav" messages to process audio files');
-Max.post('Send "preprocess /path/to/audio.wav" to preprocess problematic files first');
+Max.post('Send help for available commands and parameters');
